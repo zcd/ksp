@@ -1,0 +1,263 @@
+#+title: Kerbal Space Program Utils
+#+author: zcd
+#+property: header-args :results silent
+#+setupfile: https://fniessen.github.io/org-html-themes/org/theme-readtheorg.setup
+
+* Overview
+
+Utilities for KSP calculations. This is written in literate-style for
+ease of picking up after hiatus.
+
+* Preamble
+
+** Enable SLIME
+
+Assumes use of SLIME-based interaction.
+
+#+begin_src emacs-lisp
+  (slime)
+#+end_src
+
+** Secant-method
+  :PROPERTIES:
+  :header-args:lisp: :tangle secant-method.lisp :package secant
+  :END:
+
+This makes it easier to compute zeroes without algebraic
+manipulation. Secant is preferred over Newton's method since it
+doesn't require symbolic differentiation.
+
+#+begin_src lisp
+  (defpackage :secant
+    (:use :cl)
+    (:export :run
+             :fn-equals))
+
+  (in-package :secant)
+#+end_src
+
+\begin{equation*}
+x_n = x_{n-1} - f(x_{n-1}) \frac{x_{n-1} - x_{n-2}}{f(x_{n-1}) - f(x_{n-2})}
+\end{equation*}
+
+#+begin_src lisp
+  (defun secant-step (fn xn-1 xn-2)
+    (- xn-1
+       (* (funcall fn xn-1)
+          (/ (- xn-1 xn-2)
+             (- (funcall fn xn-1) (funcall fn xn-2))))))
+#+end_src
+
+#+begin_src lisp
+  (defun secant-iter (fn xn-1 xn-2)
+    (list fn (secant-step fn xn-1 xn-2) xn-1))
+
+  (defun run (fn &key
+                   initial
+                   (pre-initial 0)
+                   (epsilon 0.1)
+                   (verbose nil)
+                   (max-iter 100))
+    (labels ((debug (xn xn-1 i)
+               (when verbose
+                 (format t "iter#~a ~F ~@F-> ~F ~%"
+                         i
+                         xn-1
+                         (- xn xn-1)
+                         xn)))
+             (metric (xn xn-1)
+               (abs (- xn xn-1))))
+      (loop
+        repeat max-iter
+        for xn-1 = pre-initial then xn
+        and xn = initial then (secant-step fn xn xn-1)
+        for i = 0 then (incf i)
+        until (< (metric xn xn-1) epsilon)
+        do (debug xn xn-1 i)
+        finally (progn
+                  (debug xn xn-1 i)
+                  (return
+                    (secant-step fn xn xn-1))))))
+#+end_src
+
+Convenience function for converting a solution for a desired value
+into a zero solver.
+
+\begin{equation*}
+g(x) = k \rightarrow g(x) - k = 0
+\end{equation*}
+
+#+begin_src lisp
+  (defun fn-equals (fn target)
+    (lambda (test-val)
+      (- (funcall fn test-val)
+         target)))
+
+#+end_src
+
+* Delta-V Map
+
+https://i.redd.it/rli375potme61.png
+
+* Orbital Mechanics
+  :PROPERTIES:
+  :header-args:lisp: :tangle orbital-mechanics.lisp :package orbits
+  :END:
+
+Not specific to KSP.
+
+#+begin_src lisp
+  (defpackage :orbits
+    (:use :cl)
+    (:export :semimajor-axis
+             :make-orbit
+             :period))
+
+  (in-package :orbits)
+#+end_src
+
+Universal gravity constant (in $m^3 kg^{-1} s^{-2}$)
+
+#+begin_src lisp
+  (defconstant g 6.67408e-11)
+#+end_src
+
+#+begin_src lisp
+  (defstruct orbit
+    periapsis
+    apoapsis)
+
+  (defun semimajor-axis (orbit)
+    (/ (+ (orbit-apoapsis orbit)
+          (orbit-periapsis orbit))
+       2))
+
+  (defun period (orbit mass)
+    (let* ((mu (* g mass))
+           (a (semimajor-axis orbit)))
+      (* 2 pi (sqrt (/ (expt a 3)
+                       mu)))))
+#+end_src
+
+* Scripts
+  :PROPERTIES:
+  :header-args:lisp: :tangle ksp.lisp :package ksp
+  :END:
+
+#+begin_src lisp
+  (defpackage :ksp
+    (:use :cl)
+    (:import-from :secant
+     :run :fn-equals)
+    (:import-from :orbits
+     :semimajor-axis :make-orbit))
+
+  (in-package :ksp)
+#+end_src
+
+** Orbital Bodies
+
+Constants associated with kerbal orbital bodies.
+
+#+begin_src lisp
+  (defstruct kbody
+    mass
+    radius)
+
+  (defparameter *bodies*
+    `((:kerbin
+       . ,(make-kbody :mass 5.2915158e22
+                      :radius 6.0e5))
+      (:mun
+       . ,(make-kbody :mass 9.7599066e22
+                      :radius 2.0e5))
+      (:minmus
+       . ,(make-kbody :mass 2.6457580e19
+                      :radius 6.0e4))
+      (:eve
+       . ,(make-kbody :mass 1.2243980e23
+                      :radius 7.0e5))))
+
+  (defun lookup-body (body)
+    (cdr (assoc body *bodies*)))
+#+end_src
+
+** Orbits
+
+#+begin_src lisp
+  (defstruct relorbit
+    ap
+    pe
+    body)
+
+  (defun circular-relorbit (radius body)
+    (make-relorbit :ap radius
+                   :pe radius
+                   :body body))
+
+  (defun to-abs-orbit (rel)
+    (let ((rel-ap (relorbit-ap rel))
+          (rel-pe (relorbit-pe rel))
+          (radius (kbody-radius (lookup-body (relorbit-body rel)))))
+      (orbits:make-orbit :apoapsis (+ radius rel-ap)
+                         :periapsis (+ radius rel-pe))))
+#+end_src
+
+** Relay insertion
+
+Utilities of computing "resonant" circular orbits for equidistant
+satellites. This is mainly useful for setting up relay networks.
+
+For a network of 3 satellites, the following table sourced from
+https://wiki.kerbalspaceprogram.com/wiki/Tutorial:Setting_up_a_CommNet_system
+outlines the minimum visibility altitude for visibility.
+
+| Body            | Altitude (min) | Component |
+|-----------------+----------------+-----------|
+| Moho            |          2.5e5 | RA-2      |
+| Eve             |          7.0e5 | RA-2      |
+| Gilly           |          1.3e4 | RA-2      |
+| (Kerbin) Mun    |          2.0e5 | RA-2      |
+| (Kerbin) Minmus |          6.0e4 | RA-2      |
+| Duna            |          3.2e5 | RA-2      |
+| (Duna) Ike      |          1.3e5 | RA-2      |
+
+Cross-check with
+https://meyerweb.com/eric/ksp/resonant-orbits/
+
+#+begin_src lisp
+  (defun solve-for-period (body desired-period)
+    (let ((r (kbody-radius (lookup-body body)))
+          (fn (lambda (alt)
+                (orbits:period (to-abs-orbit (circular-relorbit alt
+                                                                body))
+                                                 (kbody-mass (lookup-body body))))))
+      (circular-relorbit (secant:run (secant:fn-equals fn
+                                                       desired-period)
+                                     :initial r
+                                     :pre-initial (/ r 2)
+                                     :verbose t)
+                         body)))
+
+  (defun solve-for-resonant-insertion (body desired-final-period
+                                       &key
+                                         (n 3))
+    (let* ((kb (lookup-body body))
+           (r (kbody-radius kb))
+           (desired-insertion-period (* (/ (+ n 1) n)
+                                        desired-final-period))
+           (base-alt (relorbit-ap (solve-for-period body desired-final-period)))
+           (fn (lambda (alt)
+                 (orbits:period (to-abs-orbit (make-relorbit :ap alt
+                                                             :pe base-alt
+                                                             :body body))
+                                (kbody-mass kb)))))
+      (make-relorbit
+       :ap (secant:run (secant:fn-equals fn
+                                         desired-insertion-period)
+                       :verbose t
+                       :initial r
+                       :pre-initial (/ r 2))
+       :pe base-alt
+       :body body)))
+#+end_src
